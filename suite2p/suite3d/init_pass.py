@@ -138,8 +138,8 @@ def run_init_pass(job):
         'plane_shifts' : tvecs,
         'refs_and_masks' : all_refs_masks,
         'all_ops' : all_ops,
-        'plane_mean' : init_mov.mean(axis=(1,2,3)),
-        'plane_std' : init_mov.std(axis=(1,2,3)),
+        'plane_mean' : init_mov.mean(axis=(1,2,3), dtype=job.params['dtype']),
+        'plane_std' : init_mov.std(axis=(1,2,3), dtype=job.params['dtype']),
     }
     summary_path = os.path.join(job.dirs['summary'], 'summary.npy')
     job.log("Saving summary to %s" % summary_path)
