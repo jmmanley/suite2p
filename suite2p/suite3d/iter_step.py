@@ -6,6 +6,8 @@ from turtle import ht
 import numpy as n
 import copy
 from multiprocessing import shared_memory, Pool
+from scipy.ndimage import uniform_filter
+from dask import array as darr
 
 from ..io import lbm as lbmio 
 from ..registration import register
@@ -36,6 +38,85 @@ def init_batches(tifs, batch_size, max_tifs_to_analyze=None):
         batches.append(tifs[i*batch_size : (i+1) * batch_size])
 
     return batches
+
+
+def calculate_corrmap(mov, params, dirs, log_cb = default_log, save=True):
+    # TODO This can be accelerated 
+
+    t_batch_size = params['t_batch_size']
+    temporal_hpf = params['temporal_hpf']
+    npil_hpf_xy = params['npil_hpf_xy']
+    npil_hpf_z = params['npil_hpf_z']
+    unif_filter_xy = params['unif_filter_xy']
+    unif_filter_z = params['unif_filter_z']
+    intensity_thresh = params['threshold_scaling'] * 5
+    dtype = params['dtype']
+    n_proc_corr = params['n_proc_corr']
+    mproc_batchsize = params['mproc_batchsize'] 
+    npil_filt_size = (npil_hpf_z, npil_hpf_xy, npil_hpf_xy)
+    unif_filt_size = (unif_filter_z, unif_filter_xy, unif_filter_xy)
+
+    nz, nt, ny, nx = mov.shape
+    n_batches = int(n.ceil(nt / t_batch_size))
+    if save:
+        batch_dirs, __ = init_batch_files(dirs['iters'], makedirs=True, n_batches=n_batches)
+        __, mov_sub_paths = init_batch_files(None, dirs['mov_sub'], makedirs=False, n_batches=n_batches, filename='mov_sub')
+    else: mov_sub_paths = [None] * n_batches
+
+    log_cb("Created files and dirs for %d batches" % n_batches, 1)
+    vmap2 = n.zeros((nz,ny,nx))
+    mean_img = n.zeros((nz,ny,nx))
+    max_img = n.zeros((nz,ny,nx))
+    sdmov2 = n.zeros((nz,ny,nx))
+    n_frames_proc = 0 
+    for batch_idx in range(n_batches):
+        log_cb("Running batch %d" % (batch_idx + 1), 2)
+        st_idx = batch_idx * t_batch_size
+        end_idx = min(nt, st_idx + t_batch_size)
+        n_frames_proc += end_idx - st_idx
+        movx = mov[:,st_idx:end_idx]
+        movx = darr.swapaxes(movx, 0, 1).compute().astype(dtype)
+        log_cb("Loaded and swapped from dask", 2)
+        log_cb("Calculating corr map",2)
+        calculate_corrmap_for_batch(movx, sdmov2, vmap2, mean_img, max_img, temporal_hpf, npil_filt_size, unif_filt_size, intensity_thresh,
+                                    n_frames_proc, n_proc_corr, mproc_batchsize, mov_sub_save_path=mov_sub_paths[batch_idx],
+                                    log_cb=log_cb)
+        log_cb("Saving to %s" % batch_dirs[batch_idx],2)
+        if save:
+            n.save(os.path.join(batch_dirs[batch_idx], 'vmap2.npy'), vmap2)
+            n.save(os.path.join(batch_dirs[batch_idx], 'mean_img.npy'), mean_img)
+            n.save(os.path.join(batch_dirs[batch_idx], 'max_img.npy'), max_img)
+        gc.collect()
+    
+    return vmap2
+
+
+    
+def calculate_corrmap_for_batch(mov, sdmov2, vmap2, mean_img, max_img, temporal_hpf, npil_filt_size, unif_filt_size, intensity_thresh, n_frames_proc=0,n_proc=12, mproc_batchsize = 50, mov_sub_save_path=None, log_cb=default_log ):
+                                
+    nt, nz, ny, nx = mov.shape
+    log_cb("Rolling mean filter", 3)
+    mean_img[:] = mean_img * (n_frames_proc - nt) / n_frames_proc + mov.mean(axis=0) * nt / n_frames_proc
+    max_img[:] = n.maximum(max_img, mov.max(axis=0))
+    mov = det_utils.hp_rolling_mean_filter(mov, temporal_hpf, copy=False)
+    log_cb("Stdev over time",3)
+    sdmov2 += det3d.standard_deviation_over_time(mov, batch_size=nt, sqrt=False)
+    sdmov = n.sqrt(n.maximum(1e-10, sdmov2 / n_frames_proc))
+    mov[:] = mov[:] / sdmov
+    log_cb("Sharr creation",3)
+    shmem_mov_sub, shmem_par_mov_sub, mov_sub = utils.create_shmem_from_arr(mov, copy=True)
+    del mov
+    shmem_mov_filt, shmem_par_mov_filt, mov_filt = utils.create_shmem_from_arr(
+        mov_sub, copy=False)
+    log_cb("Sub and conv", 3)
+    det3d.np_sub_and_conv3d_split_shmem(
+        shmem_par_mov_sub, shmem_par_mov_filt, npil_filt_size, unif_filt_size, n_proc=n_proc, batch_size=mproc_batchsize)
+    if mov_sub_save_path is not None:
+        n.save(mov_sub_save_path, mov_sub)
+    log_cb("Vmap", 3)
+    vmap2 += det3d.get_vmap3d(mov_filt, intensity_thresh, sqrt=False)
+    shmem_mov_sub.close(); shmem_mov_sub.unlink()
+    shmem_mov_filt.close(); shmem_mov_filt.unlink()
 
 
 def run_detection(mov3d_in, vmap2, sdmov2,n_frames_proc, temporal_high_pass_width, do_running_sdmov,
@@ -153,17 +234,20 @@ def fuse_and_save_reg_file(reg_file, reg_fused_dir, centers, shift_xs, nshift, n
     else: return mov_fused
 
 
-def init_batch_files(job_iter_dir, job_reg_data_dir, n_batches):
+def init_batch_files(job_iter_dir=None, job_reg_data_dir=None, n_batches=1, makedirs = True, filename='reg_data', dirname='batch'):
     reg_data_paths = []
     batch_dirs = []
     for batch_idx in range(n_batches):
-        reg_data_filename = 'reg_data%04d.npy' % batch_idx
-        reg_data_path = os.path.join(job_reg_data_dir, reg_data_filename)
-        reg_data_paths.append(reg_data_path)
+        if job_reg_data_dir is not None:
+            reg_data_filename = filename+'%04d.npy' % batch_idx
+            reg_data_path = os.path.join(job_reg_data_dir, reg_data_filename)
+            reg_data_paths.append(reg_data_path)
 
-        batch_dir = os.path.join(job_iter_dir, 'batch%04d' % batch_idx)
-        os.makedirs(batch_dir, exist_ok=True)
-        batch_dirs.append(batch_dir)
+        if makedirs:
+            assert job_iter_dir is not None
+            batch_dir = os.path.join(job_iter_dir, dirname + '%04d' % batch_idx)
+            os.makedirs(batch_dir, exist_ok=True)
+            batch_dirs.append(batch_dir)
 
     return batch_dirs, reg_data_paths
 
@@ -222,13 +306,10 @@ def register_dataset(tifs, params, dirs, summary, log_cb = default_log,
 
     # init accumulators
     nz, ny, nx = ref_img_3d.shape
-    example_arr = ref_img_3d
-    shmem_sum_img, shmem_sum_img_params, sum_img = utils.create_shmem_from_arr(example_arr)
-    shmem_mean_img, shmem_mean_img_params, mean_img = utils.create_shmem_from_arr(example_arr.astype(mov_dtype))
-    shmem_max_img,shmem_max_img_params, max_img = utils.create_shmem_from_arr(example_arr)
     n_frames_proc = 0
     
-    batch_dirs, reg_data_paths = init_batch_files(job_iter_dir, job_reg_data_dir, n_batches)
+    __, reg_data_paths = init_batch_files(job_iter_dir, job_reg_data_dir, n_batches, makedirs=False, filename='reg_data')
+    __, offset_paths = init_batch_files(job_iter_dir, job_reg_data_dir, n_batches, makedirs=False, filename='offsets')
 
     loaded_movs = [0]
 
@@ -246,8 +327,8 @@ def register_dataset(tifs, params, dirs, summary, log_cb = default_log,
     for batch_idx in range(start_batch_idx, n_batches):
         try:
             log_cb("Start Batch: ", level=3,log_mem_usage=True )
-            iter_dir = batch_dirs[batch_idx]
             reg_data_path = reg_data_paths[batch_idx]
+            offset_path = offset_paths[batch_idx]
             log_cb("Loading Batch %d of %d" % (batch_idx+1, n_batches), 0)
             io_thread.join()
             log_cb("Batch %d IO thread joined" % (batch_idx))
@@ -264,30 +345,16 @@ def register_dataset(tifs, params, dirs, summary, log_cb = default_log,
             log_cb("Registering Batch %d" % batch_idx, 1)
             
             log_cb("Before Reg:", level=3,log_mem_usage=True )
+            log_cb()
             all_offsets = register_mov(mov,refs_and_masks, all_ops, log_cb)
-            
+            log_cb("Saving registered file to %s" % reg_data_path, 2)
+            n.save(reg_data_path, mov)
+            n.save(os.path.join(offset_path, 'all_offsets.npy'), all_offsets)
             log_cb("After reg:", level=3,log_mem_usage=True )
 
-            n.save(os.path.join(iter_dir, 'all_offsets.npy'), all_offsets)
-
             nz, nt, ny, nx = mov.shape
             n_frames_proc_new = n_frames_proc + nt
-            
-            sum_img_batch = mov.sum(axis=1)
-            mean_img_batch = sum_img_batch / nt
-            max_img_batch = mov.max(axis=1)
-            max_img = n.max([max_img, max_img_batch], axis=0)
-            sum_img += sum_img_batch
-            mean_img = mean_img * (n_frames_proc / n_frames_proc_new) + mean_img_batch * (nt / n_frames_proc_new)
-            n_frames_proc = n_frames_proc_new
 
-            log_cb("Iteration complete, saving mean/max images to %s" % iter_dir,1)
-            n.save(os.path.join(iter_dir, 'max_img.npy'), max_img)
-            n.save(os.path.join(iter_dir, 'mean_img.npy'), mean_img)
-            n.save(os.path.join(iter_dir, 'sum_img.npy'), sum_img)
-            del sum_img_batch
-            del mean_img_batch
-            del max_img_batch
             n_cleared = gc.collect()
             log_cb("Garbage collected %d items" %n_cleared, 2)
             log_cb("After gc collect: ", level=3,log_mem_usage=True )
@@ -296,469 +363,3 @@ def register_dataset(tifs, params, dirs, summary, log_cb = default_log,
             tb = traceback.format_exc()
             log_cb(tb, 0)
             break
-
-
-def register_dataset_old(tifs, params, dirs, summary, log_cb = default_log,
-                    override_input_reg_bins=None, save_output=True, n_proc_detection=10,
-                    mem_profile=False, mem_profile_save_dir=None, debug_on_ones=False, do_detection=False, start_batch_idx = 0):
-    if not save_output:
-        log_cb("Not saving outputs to file",0)
-    if mem_profile:
-        log_cb("Profiling memory",0)
-
-    ref_img_3d = summary['ref_img_3d']
-    crosstalk_coeff = summary['crosstalk_coeff']
-    refs_and_masks = summary.get('refs_and_masks', None)
-    all_ops = summary.get('all_ops',None)
-    plane_means = summary.get('plane_mean', None)
-    plane_stds = summary.get('plane_std', None)
-
-    job_iter_dir = dirs['iters']
-    job_reg_data_dir = dirs['registered_data']
-    job_deepinterp_dir = dirs.get('deepinterp', None)
-
-    n_tifs_to_analyze = params['total_tifs_to_analyze']
-    tif_batch_size = params['tif_batch_size']
-    planes = params['planes']
-    notch_filt = params['notch_filt']
-    load_from_binary = params['load_from_binary']
-    do_subtract_crosstalk = params['subtract_crosstalk']
-    mov_dtype = params['dtype']
-    temporal_high_pass_width = params['temporal_high_pass_width']
-    do_running_sdmov = params['running_sdmov']
-    npil_hpf_xy = params['npil_high_pass_xy']
-    npil_hpf_z = params['npil_high_pass_z']
-    unif_filter_xy = params['detection_unif_filter_xy']
-    unif_filter_z = params['detection_unif_filter_z']
-    intensity_thresh = params['intensity_threshold']
-    fuse = params.get('fuse_after_registration',False)
-
-    do_deepinterp = params.get('do_deepinterp', False)
-    model_path = params.get('model_path', None)
-    n_files_before = params.get('n_files_before', 30)
-    n_files_after = params.get('n_files_after', 30)
-    crop_size = params.get('crop_size', (1024,1024))
-    batch_size = params.get('batch_size', 4)
-    do_norm_per_batch = params.get('do_norm_per_batch', False)
-    centroid = params.get("centroid", None)
-
-    if mem_profile:
-        mallocs = []
-        malloc_labels = []
-        tracemalloc.start()
-        mallocs.append(tracemalloc.take_snapshot())
-        malloc_labels.append('before initialization')
-
-    batches = init_batches(tifs, tif_batch_size, n_tifs_to_analyze)
-    n_batches = len(batches)
-    log_cb("Will analyze %d tifs in %d batches" % (len(n.concatenate(batches)), len(batches)),0)
-    if load_from_binary:
-        log_cb("Loading from saved binaries, will skip registration and crosstalk subtraction", 0)
-    
-    # init accumulators
-    nz, ny, nx = ref_img_3d.shape
-    if crop_size is not None and do_deepinterp:
-        ny, nx = crop_size
-        if do_deepinterp:
-            example_arr = n.zeros((nz,ny,nx), mov_dtype)
-        else: 
-            example_arr = n.zeros((nz,ny,nx), ref_img_3d.dtype)
-    else: example_arr = ref_img_3d
-    shmem_sum_img, shmem_sum_img_params, sum_img = utils.create_shmem_from_arr(example_arr)
-    shmem_mean_img, shmem_mean_img_params, mean_img = utils.create_shmem_from_arr(example_arr.astype(mov_dtype))
-    shmem_max_img,shmem_max_img_params, max_img = utils.create_shmem_from_arr(example_arr)
-    n_frames_proc = 0
-    
-    batch_dirs, reg_data_paths = init_batch_files(job_iter_dir, job_reg_data_dir, n_batches)
-    if override_input_reg_bins is not None:
-        reg_data_paths = override_input_reg_bins
-        n_batches = len(reg_data_paths)
-        log_cb("Reading files from user-provided location, only %d batches" % n_batches, 0)
-    if mem_profile:
-        mallocs.append(tracemalloc.take_snapshot())
-        malloc_labels.append("Before first batch")
-
-    if fuse:
-        __, fuse_xs = lbmio.load_and_stitch_full_tif_mp(tifs[0], channels=n.arange(1), get_roi_start_pix=True)
-        fuse_centers = n.sort(fuse_xs)[1:]
-        fuse_shift_xs = summary['plane_shifts'][:,1].astype(int)
-        fuse_nshift = params['fuse_nshift']
-        fuse_nbuf = params['fuse_nbuf']
-    loaded_movs = [0]
-
-    if not load_from_binary:
-        def io_thread_loader(tifs, batch_idx):
-            log_cb("   [Thread] Loading batch %d \n" % batch_idx, 20)
-            loaded_mov = lbmio.load_and_stitch_tifs(tifs, planes, filt = notch_filt, concat=True, log_cb=log_cb)
-            log_cb("   [Thread] Loaded batch %d \n" % batch_idx, 20)
-            loaded_movs[0] = loaded_mov
-            
-            log_cb("   [Thread] Thread for batch %d ready to join \n" % batch_idx, 20)
-        log_cb("Launching IO thread")
-        io_thread = threading.Thread(target=io_thread_loader, args=(batches[start_batch_idx], start_batch_idx))
-        io_thread.start()
-
-    for batch_idx in range(start_batch_idx, n_batches):
-        try:
-            if mem_profile:
-                cur, peak = tracemalloc.get_traced_memory()
-                # log_cb("Start of Batch %03d. Current Memory: %09.6f GB, Peak: %09.6f GB" % (batch_idx, cur/(1024**3), peak/(1024**3)), 0)
-                vm = psutil.virtual_memory()
-            log_cb("Start Batch: ", level=3,log_mem_usage=True )
-            iter_dir = batch_dirs[batch_idx]
-            reg_data_path = reg_data_paths[batch_idx]
-            log_cb("Loading Batch %d of %d" % (batch_idx+1, n_batches), 0)
-            if not load_from_binary:
-                io_thread.join()
-                log_cb("Batch %d IO thread joined" % (batch_idx))
-                if mem_profile:
-                    cur, peak = tracemalloc.get_traced_memory()
-                    # log_cb("After IO thread join on Batch %03d. Current Memory: %09.6f GB, Peak: %09.6f GB" % (batch_idx, cur/(1024**3), peak/(1024**3)), 0)
-                log_cb('After IO thread join', level=3,log_mem_usage=True )
-                shmem_mov,shmem_mov_params, mov = utils.create_shmem_from_arr(loaded_movs[0], copy=True)
-                
-                log_cb("After Sharr creation:", level=3,log_mem_usage=True )
-                if batch_idx + 1 < n_batches:
-                    io_thread = threading.Thread(target=io_thread_loader, args=(batches[batch_idx+1], batch_idx+1))
-                    io_thread.start()
-                    log_cb("After IO thread launch:", level=3,log_mem_usage=True )
-                if do_subtract_crosstalk:
-                    __ = subtract_crosstalk(shmem_mov_params, crosstalk_coeff, planes = planes, log_cb = log_cb)
-                log_cb("Registering Batch %d" % batch_idx, 1)
-                
-                log_cb("Before Reg:", level=3,log_mem_usage=True )
-                all_offsets = register_mov(mov,refs_and_masks, all_ops, log_cb)
-                
-                
-                log_cb("After reg:", level=3,log_mem_usage=True )
-                
-                if fuse:
-                    fuse_and_save_reg_file(reg_data_path,'\\'.join(reg_data_path.split('\\')[:-1]), mov=mov,
-                    centers=fuse_centers, shift_xs=fuse_shift_xs, nshift=fuse_nshift, nbuf=fuse_nbuf)
-                else:
-                    n.save(reg_data_path, mov)
-
-                n.save(os.path.join(iter_dir, 'all_offsets.npy'), all_offsets)
-                del all_offsets
-                
-                log_cb("After deleting offsets:", level=3,log_mem_usage=True )
-            else:
-                log_cb("Reading registered binaries from %s" % reg_data_path)
-                log_cb("Before Load: ", level=3,log_mem_usage=True )
-                mov = n.load(reg_data_path)
-                
-                log_cb("After load:", level=3,log_mem_usage=True ) 
-                shmem_mov_params = {}
-                shmem_mov = None
-
-            nz, nt, ny, nx = mov.shape
-            n_frames_proc_new = n_frames_proc + nt
-            if do_deepinterp:
-                model = dp.init_deepinterp_model(model_path)
-                n_buffer = n_files_before + n_files_after
-                buffer_full = n.zeros((nz, n_buffer, crop_size[0], crop_size[1]), mov.dtype)
-                if centroid is None:
-                    centroid = utils.get_centroid(ref_img_3d)
-                if crop_size is not None:
-                    log_cb("Cropping around " + str(centroid) )
-                    mov = utils.pad_crop_movie(mov, centroid, crop_size)
-                    
-                mov_out = dp.denoise_mov3d(model, mov, buffer_full, plane_means=plane_means,
-                                        plane_stds=plane_stds, do_norm_per_batch=do_norm_per_batch, log=log_cb)
-                log_cb("DP output shape: " + str(mov_out.shape), 2)
-                if batch_idx == 0:
-                    mov_out = mov_out[:, n_files_before:]
-                if batch_idx == n_batches-1:
-                    mov_out = mov_out[:, :-n_files_before]
-                log_cb("Saved output shape: " + str(mov_out.shape), 2)
-                mov_out = mov_out.astype(mov_dtype)
-                denoised_file = os.path.join(job_deepinterp_dir, 'dp_batch%04d_offset%02d.npy' % (batch_idx, n_files_before))
-                log_cb("Saving denoised movie to %s" % denoised_file, 1)
-                n.save(denoised_file, mov_out)
-                log_cb("Denoising done")
-                mov = mov_out
-                nz, nt, ny, nx = mov.shape
-            
-            sum_img_batch = mov.sum(axis=1)
-            mean_img_batch = sum_img_batch / nt
-            max_img_batch = mov.max(axis=1)
-
-            max_img = n.max([max_img, max_img_batch], axis=0)
-            log_cb("Before Swap:", level=3,log_mem_usage=True )
-
-            if debug_on_ones:
-                mov3d = n.ones((nt, nz, ny, nx), mov_dtype)
-            else:
-                temp3d = mov.swapaxes(0,1)
-                mov3d = temp3d.astype(mov_dtype)
-                del temp3d
-            log_cb("After Swap:", level=3,log_mem_usage=True )
-            log_cb("Freeing shared memory")
-            if shmem_mov is not None:
-                shmem_mov.close(); shmem_mov.unlink()
-            log_cb("After freeing:", level=3,log_mem_usage=True )
-            del mov; del shmem_mov
-
-            log_cb("Running detection", 1)
-            log_cb("Before detection: ", level=3,log_mem_usage=True )
-            if do_detection:
-                mov3d = run_detection(mov3d, vmap2, sdmov2, n_frames_proc, temporal_high_pass_width, do_running_sdmov,
-                            npil_hpf_xy, npil_hpf_z, unif_filter_xy, unif_filter_z, intensity_thresh,
-                            log_cb = log_cb, n_proc=n_proc_detection)
-            log_cb("After detection: ", level=3,log_mem_usage=True )
-            
-            log_cb("Update accumulators",2)
-            sum_img += sum_img_batch
-            mean_img = mean_img * (n_frames_proc / n_frames_proc_new) + mean_img_batch * (nt / n_frames_proc_new)
-
-            if batch_idx > 0:
-                del vmap
-            vmap = vmap2 ** .5
-            n_frames_proc = n_frames_proc_new
-
-            log_cb("Iteration complete",1)
-            if save_output and do_detection:
-                log_cb("Saving outputs to %s" % iter_dir, 1)
-                n.save(os.path.join(iter_dir, 'vmap.npy'), vmap)
-                # n.save(os.path.join(iter_dir, 'mov_sub.npy'), mov3d)
-                n.save(os.path.join(iter_dir, 'max_img.npy'), max_img)
-                n.save(os.path.join(iter_dir, 'mean_img.npy'), mean_img)
-                n.save(os.path.join(iter_dir, 'sum_img.npy'), sum_img)
-            del mov3d
-            del sum_img_batch
-            del mean_img_batch
-            del max_img_batch
-            if mem_profile:
-                mallocs.append(tracemalloc.take_snapshot())
-                malloc_labels.append("End of batch %d" % batch_idx)
-                n.save(os.path.join(mem_profile_save_dir, 'mem_profiles_end_of_batch%05d.npy'  % batch_idx), (mallocs, malloc_labels))
-                mallocs = []; malloc_labels = [];
-            log_cb("After saving: ", level=3,log_mem_usage=True )
-            n_cleared = gc.collect()
-            log_cb("Garbage collected %d items" %n_cleared, 2)
-            log_cb("After gc collect: ", level=3,log_mem_usage=True )
-
-        except Exception as exc:
-            log_cb("Error occured in iteration %d" % batch_idx, 0 )
-            tb = traceback.format_exc()
-            log_cb(tb, 0)
-            break
-
-
-    output = {
-        'vmap' : vmap,
-        'max_img' :max_img,
-        'mean_img' : mean_img,
-        'sum_img' : sum_img
-    }
-
-    if mem_profile:
-        output['mallocs'] = mallocs
-        output['malloc_labels'] = malloc_labels
-        n.save(os.path.join(mem_profile_save_dir, 'mem_profile_out.npy'), output)
-
-
-    # return output
-
-
-# def iter_dataset_slow(tifs, params, dirs, summary, log_cb=default_log,
-#                       override_input_reg_bins=None, save_output=True,
-#                       mem_profile=False, mem_profile_save_dir=None):
-#     if not save_output:
-#         log_cb("Not saving outputs to file", 0)
-#     if mem_profile:
-#         log_cb("Profiling memory", 0)
-
-#     ref_img_3d = summary['ref_img_3d']
-#     crosstalk_coeff = summary['crosstalk_coeff']
-#     refs_and_masks = summary.get('refs_and_masks', None)
-#     all_ops = summary.get('all_ops', None)
-#     plane_means = summary.get('plane_mean', None)
-#     plane_stds = summary.get('plane_std', None)
-
-#     job_iter_dir = dirs['iters']
-#     job_reg_data_dir = dirs['registered_data']
-#     job_deepinterp_dir = dirs['deepinterp']
-
-#     n_tifs_to_analyze = params['total_tifs_to_analyze']
-#     tif_batch_size = params['tif_batch_size']
-#     planes = params['planes']
-#     notch_filt = params['notch_filt']
-#     load_from_binary = params['load_from_binary']
-#     do_subtract_crosstalk = params['subtract_crosstalk']
-#     mov_dtype = params['dtype']
-#     temporal_high_pass_width = params['temporal_high_pass_width']
-#     do_running_sdmov = params['running_sdmov']
-#     npil_hpf_xy = params['npil_high_pass_xy']
-#     npil_hpf_z = params['npil_high_pass_z']
-#     unif_filter_xy = params['detection_unif_filter_xy']
-#     unif_filter_z = params['detection_unif_filter_z']
-#     intensity_thresh = params['intensity_threshold']
-
-#     do_deepinterp = params.get('do_deepinterp', False)
-#     model_path = params.get('model_path', None)
-#     n_files_before = params.get('n_files_before', 30)
-#     n_files_after = params.get('n_files_after', 30)
-#     crop_size = params.get('crop_size', (1024, 1024))
-#     batch_size = params.get('batch_size', 4)
-#     do_norm_per_batch = params.get('do_norm_per_batch', False)
-#     centroid = params.get("centroid", None)
-
-#     if mem_profile:
-#         mallocs = []
-#         malloc_labels = []
-#         tracemalloc.start()
-#         mallocs.append(tracemalloc.take_snapshot())
-#         malloc_labels.append('before initialization')
-
-#     batches = init_batches(tifs, tif_batch_size, n_tifs_to_analyze)
-#     n_batches = len(batches)
-#     log_cb("Will analyze %d tifs in %d batches" %
-#            (len(n.concatenate(batches)), len(batches)), 0)
-#     if load_from_binary:
-#         log_cb(
-#             "Loading from saved binaries, will skip registration and crosstalk subtraction", 0)
-
-#     # init accumulators
-#     nz, ny, nx = ref_img_3d.shape
-#     if crop_size is not None and do_deepinterp:
-#         ny, nx = crop_size
-#         if do_deepinterp:
-#             example_arr = n.zeros((nz, ny, nx), mov_dtype)
-#         else:
-#             example_arr = n.zeros((nz, ny, nx), ref_img_3d.dtype)
-#     else:
-#         example_arr = ref_img_3d
-#     shmem_sum_img, shmem_sum_img_params, sum_img = utils.create_shmem_from_arr(
-#         example_arr)
-#     shmem_mean_img, shmem_mean_img_params, mean_img = utils.create_shmem_from_arr(
-#         example_arr.astype(mov_dtype))
-#     shmem_max_img, shmem_max_img_params, max_img = utils.create_shmem_from_arr(
-#         example_arr)
-#     shmem_vmap2, shmem_vmap2_params, vmap2 = utils.create_shmem_from_arr(
-#         example_arr.astype(mov_dtype))
-#     shmem_sdmov2, shmem_sdmov2_params, sdmov2 = utils.create_shmem_from_arr(
-#         example_arr.astype(mov_dtype))
-#     n_frames_proc = 0
-
-#     batch_dirs, reg_data_paths = init_batch_files(
-#         job_iter_dir, job_reg_data_dir, n_batches)
-#     if override_input_reg_bins is not None:
-#         reg_data_paths = override_input_reg_bins
-#         n_batches = len(reg_data_paths)
-#         log_cb("Reading files from user-provided location, only %d batches" %
-#                n_batches, 0)
-#     if mem_profile:
-#         mallocs.append(tracemalloc.take_snapshot())
-#         malloc_labels.append("Before first batch")
-
-#     for batch_idx in range(n_batches):
-#         try:
-#             iter_dir = batch_dirs[batch_idx]
-#             reg_data_path = reg_data_paths[batch_idx]
-#             # log_cb("Loading Batch %d of %d" % (batch_idx, n_batches), 0)
-#             if not load_from_binary:
-
-#                 tifs = batches[batch_idx]
-#                 mov = lbmio.load_and_stitch_tifs(
-#                     tifs, planes, filt=notch_filt, concat=True, log_cb=log_cb)
-#                 shmem_mov, shmem_mov_params, mov = utils.create_shmem_from_arr(
-#                     mov, copy=True)
-#                 if do_subtract_crosstalk:
-#                     __ = subtract_crosstalk(
-#                         shmem_mov_params, crosstalk_coeff, planes=planes, log_cb=log_cb)
-#                 log_cb("Registering Batch %d" % batch_idx, 1)
-#                 all_offsets = register_mov(
-#                     mov, refs_and_masks, all_ops, log_cb)
-#                 if save_output:
-#                     log_cb("Saving registered file to %s" % reg_data_path, 2)
-#                     n.save(reg_data_path, mov)
-#                     n.save(os.path.join(iter_dir, 'all_offsets.npy'), all_offsets)
-#             else:
-#                 log_cb("Reading registered binaries from %s" % reg_data_path)
-#                 mov = n.load(reg_data_path)
-#                 shmem_mov_params = {}
-
-#             nz, nt, ny, nx = mov.shape
-#             n_frames_proc_new = n_frames_proc + nt
-#             if do_deepinterp:
-#                 model = dp.init_deepinterp_model(model_path)
-#                 n_buffer = n_files_before + n_files_after
-#                 buffer_full = n.zeros(
-#                     (nz, n_buffer, crop_size[0], crop_size[1]), mov.dtype)
-#                 if centroid is None:
-#                     centroid = utils.get_centroid(ref_img_3d)
-#                 if crop_size is not None:
-#                     log_cb("Cropping around " + str(centroid))
-#                     mov = utils.pad_crop_movie(mov, centroid, crop_size)
-
-#                 mov_out = dp.denoise_mov3d(model, mov, buffer_full, plane_means=plane_means,
-#                                            plane_stds=plane_stds, do_norm_per_batch=do_norm_per_batch, log=log_cb)
-#                 log_cb("DP output shape: " + str(mov_out.shape), 2)
-#                 if batch_idx == 0:
-#                     mov_out = mov_out[:, n_files_before:]
-#                 if batch_idx == n_batches-1:
-#                     mov_out = mov_out[:, :-n_files_before]
-#                 log_cb("Saved output shape: " + str(mov_out.shape), 2)
-#                 mov_out = mov_out.astype(mov_dtype)
-#                 denoised_file = os.path.join(
-#                     job_deepinterp_dir, 'dp_batch%04d_offset%02d.npy' % (batch_idx, n_files_before))
-#                 log_cb("Saving denoised movie to %s" % denoised_file, 1)
-#                 n.save(denoised_file, mov_out)
-#                 log_cb("Denoising done")
-#                 mov = mov_out
-#                 nz, nt, ny, nx = mov.shape
-
-#             sum_img_batch = mov.sum(axis=1)
-#             mean_img_batch = sum_img_batch / nt
-#             max_img_batch = mov.max(axis=1)
-
-#             max_img = n.max([max_img, max_img_batch], axis=0)
-#             mov3d = mov.swapaxes(0, 1).astype(mov_dtype)
-#             log_cb("Freeing shared memory")
-#             utils.close_and_unlink_shmem(shmem_mov_params)
-
-#             log_cb("Running detection", 1)
-#             run_detection(mov3d, vmap2, sdmov2, n_frames_proc, temporal_high_pass_width, do_running_sdmov,
-#                           npil_hpf_xy, npil_hpf_z, unif_filter_xy, unif_filter_z, intensity_thresh,
-#                           log_cb=log_cb)
-
-#             log_cb("Update accumulators", 2)
-#             sum_img += sum_img_batch
-#             mean_img = mean_img_batch * \
-#                 (n_frames_proc / n_frames_proc_new) + \
-#                 mean_img_batch * (nt / n_frames_proc_new)
-
-#             vmap = vmap2 ** .5
-#             n_frames_proc = n_frames_proc_new
-
-#             log_cb("Iteration complete", 1)
-#             if save_output:
-#                 log_cb("Saving outputs to %s" % iter_dir, 1)
-#                 n.save(os.path.join(iter_dir, 'vmap.npy'), vmap)
-#                 n.save(os.path.join(iter_dir, 'max_img.npy'), max_img)
-#                 n.save(os.path.join(iter_dir, 'mean_img.npy'), mean_img)
-#                 n.save(os.path.join(iter_dir, 'sum_img.npy'), sum_img)
-
-#             if mem_profile:
-#                 mallocs.append(tracemalloc.take_snapshot())
-#                 malloc_labels.append("End of batch %d" % batch_idx)
-#         except Exception as exc:
-#             log_cb("Error occured in iteration %d" % batch_idx, 0)
-#             tb = traceback.format_exc()
-#             log_cb(tb, 0)
-#             break
-
-#     output = {
-#         'vmap': vmap,
-#         'max_img': max_img,
-#         'mean_img': mean_img,
-#         'sum_img': sum_img
-#     }
-
-#     if mem_profile:
-#         output['mallocs'] = mallocs
-#         output['malloc_labels'] = malloc_labels
-#         n.save(os.path.join(mem_profile_save_dir, 'mem_profile_out.npy'), output)
-
-#     return output

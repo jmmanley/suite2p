@@ -1,3 +1,4 @@
+
 import tifffile
 from cmath import log
 import datetime
@@ -8,7 +9,7 @@ from . import utils as u3d
 import psutil
 from suite2p.io import lbm as lbmio
 from multiprocessing import Pool
-from suite2p.suite3d.iter_step import fuse_and_save_reg_file
+from suite2p.suite3d.iter_step import register_dataset, fuse_and_save_reg_file, calculate_corrmap
 
 class Job:
     def __init__(self, root_dir, job_id, params=None, tifs=None, exist_ok=False, verbosity=10, create=True):
@@ -35,21 +36,7 @@ class Job:
             self.tifs = self.params.get('tifs', [])
             
         self.save_params()
-               
-    def fuse_registered_movie(self, n_buf, n_shift, files=None, save=False, n_proc=4):
-        if files is None:
-            files = self.get_registered_files()
-        __, xs = lbmio.load_and_stitch_full_tif_mp(self.tifs[0], channels=n.arange(1), get_roi_start_pix=True)
-        centers = n.sort(xs)[1:]
-        shift_xs = n.round(self.load_summary()['plane_shifts'][:,1]).astype(int)
-        if save:
-            reg_fused_dir = self.make_new_dir('registered_fused_data')
-        else: reg_fused_dir = ''
-        with Pool(n_proc) as p:
-            fused_files = p.starmap(fuse_and_save_reg_file, [(file, reg_fused_dir, centers,  shift_xs, n_buf, n_shift, None, None, save) for file in files])
-        if not save:
-            fused_files = n.concatenate(fused_files, axis=1)
-        return fused_files
+
 
     def log(self, string='', level=1, logfile=True, log_mem_usage=False):
         """Print messages based on current verbosity level
@@ -144,7 +131,7 @@ class Job:
         else:
             os.makedirs(job_dir, exist_ok=True)
 
-        self.log("Creating job directory for %s in %s" %
+        self.log("Loading job directory for %s in %s" %
                     (job_id, root_dir), 0)
         if 'dirs.npy' in os.listdir(job_dir):
             self.log("Loading dirs ")
@@ -177,6 +164,11 @@ class Job:
         n.save(os.path.join(self.dirs['summary'],
                'summary.npy'), summary_old_job)
     
+    def register(self, tifs=None, start_batch_idx = 0):
+        if tifs is None:
+            tifs = self.tifs
+        register_dataset(tifs, self.params, self.dirs, self.load_summary(), self.log, start_batch_idx = start_batch_idx)
+
     def get_registered_files(self, key='registered_data', filename_filter='reg_data'):
         all_files = n.os.listdir(self.dirs[key])
         reg_files = [os.path.join(self.dirs[key],x) for x in all_files if x.startswith(filename_filter)]
@@ -191,21 +183,37 @@ class Job:
         iter_dirs = [os.path.join(iters_dir, dir) for dir in os.listdir(iters_dir)]
         ret = []
         for dir in iter_dirs:
-            if 'vmap.npy' in os.listdir(dir):
+            if 'vmap.npy' in os.listdir(dir) or 'vmap2.npy' in os.listdir(dir):
                 ret.append(dir)
         return ret
     
     def load_iter_results(self, iter_idx):
         iter_dir = self.get_iter_dirs()[iter_idx]
         self.log("Loading from %s" % iter_dir)
-        res = {
-            'vmap' : n.load(os.path.join(iter_dir, 'vmap.npy')),
-            'max_img' : n.load(os.path.join(iter_dir, 'max_img.npy')),
-            'mean_img' : n.load(os.path.join(iter_dir, 'mean_img.npy')),
-            'sum_img' : n.load(os.path.join(iter_dir, 'sum_img.npy')),
-        }
+        res = {}
+        for filename in ['vmap', 'max_img', 'mean_img', 'sum_img', 'vmap2']:
+            if filename + '.npy' in os.listdir(iter_dir):
+                res[filename] = n.load(os.path.join(iter_dir, filename + '.npy'))
         return res
 
+    def fuse_registered_movie(self, n_shift, n_buf, files=None, save=False, n_proc=4):
+        if files is None:
+            files = self.get_registered_files()
+        __, xs = lbmio.load_and_stitch_full_tif_mp(
+            self.tifs[0], channels=n.arange(1), get_roi_start_pix=True)
+        centers = n.sort(xs)[1:]
+        shift_xs = n.round(self.load_summary()[
+                           'plane_shifts'][:, 1]).astype(int)
+        if save:
+            reg_fused_dir = self.make_new_dir('registered_fused_data')
+        else:
+            reg_fused_dir = ''
+        with Pool(n_proc) as p:
+            fused_files = p.starmap(fuse_and_save_reg_file, [(
+                file, reg_fused_dir, centers,  shift_xs, n_shift, n_buf, None, None, save) for file in files])
+        if not save:
+            fused_files = n.concatenate(fused_files, axis=1)
+        return fused_files
 
     def get_subtracted_movie(self):
         mov_sub_paths = []

@@ -192,6 +192,70 @@ def np_sub_and_conv3d_shmem(shmem_in, np_filt_size, conv_filt_size, n_proc=8, ba
         pool.terminate()
 
 
+
+def np_sub_and_conv3d_split_shmem_w(sub_par, filt_par, idxs, np_filt_size,conv_filt_size, c1, c2):
+    sub_sh, mov_sub = utils3d.load_shmem(sub_par)
+    filt_sh,   mov_filt = utils3d.load_shmem(filt_par)
+    for idx in idxs:
+        mov_sub[idx] = mov_sub[idx] - \
+            (uniform_filter(mov_sub[idx], size=np_filt_size, mode='constant') / c1)
+        mov_filt[idx] = uniform_filter(mov_sub[idx], size=conv_filt_size, mode='constant') / c2
+    sub_sh.close(); filt_sh.close()
+
+def np_sub_and_conv3d_split_shmem(shmem_sub, shmem_filt, np_filt_size, conv_filt_size, n_proc=8, batch_size=50, pool=None):
+    nt, Lz, Ly, Lx = shmem_sub['shape']
+    c1 = uniform_filter(n.ones((Lz, Ly, Lx)), np_filt_size, mode='constant')
+    c2 = uniform_filter(n.ones((Lz, Ly, Lx)), conv_filt_size, mode='constant')
+
+    batches = [n.arange(idx, min(nt, idx+batch_size))
+               for idx in n.arange(0, nt, batch_size)]
+    close = True
+    if pool is None:
+        pool = multiprocessing.Pool(n_proc)
+        close=False
+    pool.starmap(np_sub_and_conv3d_split_shmem_w, [
+                 (shmem_sub, shmem_filt, b, np_filt_size, conv_filt_size, c1, c2) for b in batches])
+    if close:
+        pool.close()
+        pool.terminate()
+
+
+
+def np_sub_shmem_w(in_par, idxs, np_filt_size, c1):
+    shin, mov_in = utils3d.load_shmem(in_par)
+    for idx in idxs:
+        mov_in[idx] = mov_in[idx] - \
+            (uniform_filter(mov_in[idx],
+             size=np_filt_size, mode='constant') / c1)
+
+
+
+def np_sub_shmem(shmem_in, np_filt_size, n_proc=8, batch_size=50, pool=None):
+    """
+    WARNING: this is not optimal because the process startup time is quite long for each process
+    seems like this is because each subprocess imports suite2p, which takes about 1-2 seconds
+    this should all be in parallel, but in reality it causes memory bottlenecks so lasts about ~10 seconsds
+    so if you have a mp.pool().starmap() that does nothing, it takes 10 seconds to run
+    this is because windows does not have forking and python uses the "spawn" start method
+    https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods
+    in the future: either maintain the same processes for the whole thing, or figure out something else
+    """
+    nt, Lz, Ly, Lx = shmem_in['shape']
+    c1 = uniform_filter(n.ones((Lz, Ly, Lx)), np_filt_size, mode='constant')
+
+    batches = [n.arange(idx, min(nt, idx+batch_size))
+               for idx in n.arange(0, nt, batch_size)]
+    close = True
+    if pool is None:
+        pool = multiprocessing.Pool(n_proc)
+        close = False
+    pool.starmap(np_sub_shmem_w, [
+                 (shmem_in, b, np_filt_size, c1) for b in batches])
+    if close:
+        pool.close()
+        pool.terminate()
+
+
 def square_convolution_2d(mov: np.ndarray, filter_size: int, filter_size_z: int) -> np.ndarray:
     """Returns movie convolved by uniform kernel with width 'filter_size'."""
     movt = np.zeros_like(mov, dtype=np.float32)
@@ -200,7 +264,6 @@ def square_convolution_2d(mov: np.ndarray, filter_size: int, filter_size_z: int)
         framet[:] = filter_size * \
             uniform_filter(frame, size=filt_size, mode='constant')
     return movt
-
 
 
 
