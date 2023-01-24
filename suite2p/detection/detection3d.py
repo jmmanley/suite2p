@@ -139,11 +139,12 @@ def square_convolution_2d(mov: np.ndarray, filter_size: int, filter_size_z: int)
         framet[:] = filter_size * uniform_filter(frame, size=filt_size, mode='constant')
     return movt
 
-def get_vmap3d(movu0,intensity_threshold=None, fix_edges=True, sqrt=True):
+def get_vmap3d(movu0,intensity_threshold=None, fix_edges=True, sqrt=True,mean_subtract=True):
     nt, nz, ny, nx = movu0.shape
     vmap = n.zeros((nz,ny,nx))
     for i in range(nz):
-        vmap[i] = threshold_reduce(movu0[:,i], intensity_threshold, mean_subtract=True, fix_edges=fix_edges, sqrt=sqrt)
+        vmap[i] = threshold_reduce(movu0[:, i], intensity_threshold,
+                                   mean_subtract=mean_subtract, fix_edges=fix_edges, sqrt=sqrt)
     return vmap
 
 def get_vmap3d_shmem_w(shmem_in, shmem_vmap, z_idx, intensity_threshold, fix_edges, sqrt):

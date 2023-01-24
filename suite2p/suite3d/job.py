@@ -169,6 +169,16 @@ class Job:
             tifs = self.tifs
         register_dataset(tifs, self.params, self.dirs, self.load_summary(), self.log, start_batch_idx = start_batch_idx)
 
+    def calculate_corr_map(self, mov=None):
+        self.make_new_dir('mov_sub')
+        if mov is None:
+            mov = self.get_registered_movie('registered_fused_data', 'fused')
+        vmap = calculate_corrmap(mov, self.params, self.dirs, self.log)
+        return vmap
+
+    def extract_cells_from_patch(self, patch_idx = 0):
+        pass
+
     def get_registered_files(self, key='registered_data', filename_filter='reg_data'):
         all_files = n.os.listdir(self.dirs[key])
         reg_files = [os.path.join(self.dirs[key],x) for x in all_files if x.startswith(filename_filter)]

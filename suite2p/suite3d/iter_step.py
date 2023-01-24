@@ -40,7 +40,7 @@ def init_batches(tifs, batch_size, max_tifs_to_analyze=None):
     return batches
 
 
-def calculate_corrmap(mov, params, dirs, log_cb = default_log, save=True):
+def calculate_corrmap(mov, params, dirs, log_cb = default_log, save=True, return_mov_filt=False):
     # TODO This can be accelerated 
 
     t_batch_size = params['t_batch_size']
@@ -49,7 +49,7 @@ def calculate_corrmap(mov, params, dirs, log_cb = default_log, save=True):
     npil_hpf_z = params['npil_hpf_z']
     unif_filter_xy = params['unif_filter_xy']
     unif_filter_z = params['unif_filter_z']
-    intensity_thresh = params['threshold_scaling'] * 5
+    intensity_thresh = 0
     dtype = params['dtype']
     n_proc_corr = params['n_proc_corr']
     mproc_batchsize = params['mproc_batchsize'] 
@@ -61,7 +61,7 @@ def calculate_corrmap(mov, params, dirs, log_cb = default_log, save=True):
     if save:
         batch_dirs, __ = init_batch_files(dirs['iters'], makedirs=True, n_batches=n_batches)
         __, mov_sub_paths = init_batch_files(None, dirs['mov_sub'], makedirs=False, n_batches=n_batches, filename='mov_sub')
-        og_cb("Created files and dirs for %d batches" % n_batches, 1)
+        log_cb("Created files and dirs for %d batches" % n_batches, 1)
     else: mov_sub_paths = [None] * n_batches
 
     vmap2 = n.zeros((nz,ny,nx))
@@ -76,23 +76,25 @@ def calculate_corrmap(mov, params, dirs, log_cb = default_log, save=True):
         n_frames_proc += end_idx - st_idx
         movx = mov[:,st_idx:end_idx]
         movx = darr.swapaxes(movx, 0, 1).compute().astype(dtype)
-        log_cb("Loaded and swapped from dask", 2)
+        log_cb("Loaded and swapped from dask, idx %d to %d" % (st_idx, end_idx), 2)
         log_cb("Calculating corr map",2)
-        calculate_corrmap_for_batch(movx, sdmov2, vmap2, mean_img, max_img, temporal_hpf, npil_filt_size, unif_filt_size, intensity_thresh,
+        mov_filt = calculate_corrmap_for_batch(movx, sdmov2, vmap2, mean_img, max_img, temporal_hpf, npil_filt_size, unif_filt_size, intensity_thresh,
                                     n_frames_proc, n_proc_corr, mproc_batchsize, mov_sub_save_path=mov_sub_paths[batch_idx],
-                                    log_cb=log_cb)
+                                    log_cb=log_cb, return_mov_filt=return_mov_filt)
         if save:
             log_cb("Saving to %s" % batch_dirs[batch_idx],2)
             n.save(os.path.join(batch_dirs[batch_idx], 'vmap2.npy'), vmap2)
+            n.save(os.path.join(batch_dirs[batch_idx], 'vmap.npy'), vmap2**0.5)
             n.save(os.path.join(batch_dirs[batch_idx], 'mean_img.npy'), mean_img)
             n.save(os.path.join(batch_dirs[batch_idx], 'max_img.npy'), max_img)
         gc.collect()
-    
-    return vmap2
+    if return_mov_filt:
+        return mov_filt, vmap2 ** 0.5
+    return vmap2 ** 0.5
 
 
     
-def calculate_corrmap_for_batch(mov, sdmov2, vmap2, mean_img, max_img, temporal_hpf, npil_filt_size, unif_filt_size, intensity_thresh, n_frames_proc=0,n_proc=12, mproc_batchsize = 50, mov_sub_save_path=None, log_cb=default_log ):
+def calculate_corrmap_for_batch(mov, sdmov2, vmap2, mean_img, max_img, temporal_hpf, npil_filt_size, unif_filt_size, intensity_thresh, n_frames_proc=0,n_proc=12, mproc_batchsize = 50, mov_sub_save_path=None, log_cb=default_log, return_mov_filt=False ):
                                 
     nt, nz, ny, nx = mov.shape
     log_cb("Rolling mean filter", 3)
@@ -114,9 +116,15 @@ def calculate_corrmap_for_batch(mov, sdmov2, vmap2, mean_img, max_img, temporal_
     if mov_sub_save_path is not None:
         n.save(mov_sub_save_path, mov_sub)
     log_cb("Vmap", 3)
-    vmap2 += det3d.get_vmap3d(mov_filt, intensity_thresh, sqrt=False)
+    vmap2 += det3d.get_vmap3d(mov_filt, intensity_thresh, sqrt=False, mean_subtract=False)
+    if return_mov_filt:
+        retfilt = mov_filt.copy()
     shmem_mov_sub.close(); shmem_mov_sub.unlink()
     shmem_mov_filt.close(); shmem_mov_filt.unlink()
+    if return_mov_filt:
+        return retfilt
+    else:
+        return None
 
 
 def run_detection(mov3d_in, vmap2, sdmov2,n_frames_proc, temporal_high_pass_width, do_running_sdmov,

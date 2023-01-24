@@ -6,9 +6,9 @@ import numpy as n
 def default_log(string, *args, **kwargs): 
     print(string)
 
-def extract_cells(patch, vmap, max_iter = 10000, threshold_scaling = 0.5, extend_thresh=0.2, 
+def detect_cells(patch, vmap, max_iter = 10000, threshold_scaling = 0.5, extend_thresh=0.2, 
                     roi_ext_iterations=2, max_ext_iters=20, percentile=0, log=default_log, 
-                    magic_number=1200, recompute_v = False):
+                    magic_number=1200, recompute_v = False, offset=(0,0,0), savepath=None, debug=False,**kwargs):
     nt, nz, ny, nx = patch.shape
     stats = []
 
@@ -30,7 +30,7 @@ def extract_cells(patch, vmap, max_iter = 10000, threshold_scaling = 0.5, extend
 
         for i in range(roi_ext_iterations):
             zz,yy,xx,lam = iter_extend3d(zz,yy,xx,active_frames, patch, extend_thresh=extend_thresh,
-                                            max_ext_iters=max_ext_iters, verbose=False)
+                                            max_ext_iters=max_ext_iters, verbose=debug)
             tproj = patch[:,zz,yy,xx] @ lam
             active_frames = n.nonzero(tproj > threshold)[0]
             npix = len(lam)
@@ -46,14 +46,21 @@ def extract_cells(patch, vmap, max_iter = 10000, threshold_scaling = 0.5, extend
             vmap[zz,yy,xx] = vmin
         
         stat = {
-            'coords' : (zz,yy,xx),
+            'coords_patch' : (zz,yy,xx),
+            'coords' : (zz+offset[0],yy+offset[1],xx+offset[2]),
             'lam' : lam,
             'med' : med,
             'active_frames' : active_frames
         }
         stats.append(stat)
-        log("Added cell %d with peak: %0.3f" % (len(stats), peak_val), 2)
+        log("Added cell %d at %02d, %03d, %03d with peak: %0.3f and %d pixels" % (len(stats), med[0],med[1],med[2], peak_val, npix), 2)
+        if savepath is not None and iter_idx % 250 == 0 and iter_idx > 0:
+            n.save(savepath,stats)
+            log("Saving checkpoint to %s" % savepath)
     log("Found %d cells in %d iterations" % (len(stats), max_iter))
+    if savepath is not None:
+        log("Saving cells to %s" % savepath)
+        n.save(savepath, stats)
     return stats
     
 
@@ -107,6 +114,8 @@ def iter_extend3d(zz,yy,xx, active_frames, mov, verbose=False, extend_thresh=0.2
     iter_idx = 0
     mov_act = mov[active_frames].mean(axis=0)
     # lam = n.array([lam0])
+
+    # TODO HERE IS A BUG that causes many cells with break - no pix condition
     while npix < 10000 and iter_idx < max_ext_iters:
         npix = len(yy)
         zz, yy, xx = extend_roi3d(zz,yy,xx, mov.shape[1:], extend_z=extend_z)
