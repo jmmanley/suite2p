@@ -61,9 +61,9 @@ def calculate_corrmap(mov, params, dirs, log_cb = default_log, save=True):
     if save:
         batch_dirs, __ = init_batch_files(dirs['iters'], makedirs=True, n_batches=n_batches)
         __, mov_sub_paths = init_batch_files(None, dirs['mov_sub'], makedirs=False, n_batches=n_batches, filename='mov_sub')
+        og_cb("Created files and dirs for %d batches" % n_batches, 1)
     else: mov_sub_paths = [None] * n_batches
 
-    log_cb("Created files and dirs for %d batches" % n_batches, 1)
     vmap2 = n.zeros((nz,ny,nx))
     mean_img = n.zeros((nz,ny,nx))
     max_img = n.zeros((nz,ny,nx))
@@ -81,8 +81,8 @@ def calculate_corrmap(mov, params, dirs, log_cb = default_log, save=True):
         calculate_corrmap_for_batch(movx, sdmov2, vmap2, mean_img, max_img, temporal_hpf, npil_filt_size, unif_filt_size, intensity_thresh,
                                     n_frames_proc, n_proc_corr, mproc_batchsize, mov_sub_save_path=mov_sub_paths[batch_idx],
                                     log_cb=log_cb)
-        log_cb("Saving to %s" % batch_dirs[batch_idx],2)
         if save:
+            log_cb("Saving to %s" % batch_dirs[batch_idx],2)
             n.save(os.path.join(batch_dirs[batch_idx], 'vmap2.npy'), vmap2)
             n.save(os.path.join(batch_dirs[batch_idx], 'mean_img.npy'), mean_img)
             n.save(os.path.join(batch_dirs[batch_idx], 'max_img.npy'), max_img)
@@ -349,7 +349,7 @@ def register_dataset(tifs, params, dirs, summary, log_cb = default_log,
             all_offsets = register_mov(mov,refs_and_masks, all_ops, log_cb)
             log_cb("Saving registered file to %s" % reg_data_path, 2)
             n.save(reg_data_path, mov)
-            n.save(os.path.join(offset_path, 'all_offsets.npy'), all_offsets)
+            n.save(offset_path, all_offsets)
             log_cb("After reg:", level=3,log_mem_usage=True )
 
             nz, nt, ny, nx = mov.shape
